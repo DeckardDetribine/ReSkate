@@ -197,11 +197,18 @@ struct AssetAddition {
     std::string toc;
     std::vector<fb::TocChunk> chunks; // new chunks referenced by this addition
 };
+// Asset-mod chunks needed by level streaming even without a matching bundle.
+struct ModChunk {
+    std::string mod;
+    fb::TocChunk chunk;
+};
 struct AssetOverrides {
-    // By lower-case asset name, then the game's sha1 the change replaces.
-    std::map<std::string, std::map<fb::Sha1, AssetOverride>, std::less<>> changed;
+    // By lower-case bundle name, then lower-case asset name, then the game's sha1 the change replaces.
+    std::map<std::string, std::map<std::string, std::map<fb::Sha1, AssetOverride>, std::less<>>, std::less<>> changed;
     // By lower-case bundle name, in priority order.
     std::map<std::string, std::vector<AssetAddition>, std::less<>> added;
+
+    std::vector<ModChunk> modChunks; // highest-priority mod first
 
     [[nodiscard]] bool empty() const noexcept { return changed.empty() && added.empty(); }
 };

@@ -298,10 +298,13 @@ MergeReport merge_mods(const Catalog& catalog, const MergeObserver& observe, con
                 if (mod->name == modName)
                     store.shift(chunk.location, chunk.offset, &placements[mod]);
         };
-        for (auto& [name, versions] : overrides.changed)
-            for (auto& [sha1, change] : versions)
-                for (auto& chunk : change.chunks)
-                    shift_chunk(chunk, change.mod);
+        for (auto& modChunk : overrides.modChunks)
+            shift_chunk(modChunk.chunk, modChunk.mod);
+        for (auto& [bundleName, bundleChanged] : overrides.changed)
+            for (auto& [name, versions] : bundleChanged)
+                for (auto& [sha1, change] : versions)
+                    for (auto& chunk : change.chunks)
+                        shift_chunk(chunk, change.mod);
         for (auto& [bundle, list] : overrides.added)
             for (auto& addition : list)
                 for (auto& chunk : addition.chunks)

@@ -7,10 +7,11 @@ endif()
 add_library(dingosdk_launcher_support STATIC
     Engine/Core/Platform/launcher_support.cpp
     Engine/Core/Platform/launcher_pe.cpp
-    $<$<BOOL:${WIN32}>:Engine/Core/Platform/launcher_injection.cpp>)
+    $<$<BOOL:${WIN32}>:Engine/Core/Platform/launcher_injection.cpp>
+    $<$<BOOL:${WIN32}>:Engine/Core/Debug/force_dump.cpp>)
 
 if(WIN32)
-    target_link_libraries(dingosdk_launcher_support PUBLIC bcrypt)
+    target_link_libraries(dingosdk_launcher_support PUBLIC bcrypt dbghelp)
 else()
     find_package(OpenSSL REQUIRED)
     target_link_libraries(dingosdk_launcher_support PUBLIC OpenSSL::Crypto)

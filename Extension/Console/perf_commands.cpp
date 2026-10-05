@@ -3,7 +3,10 @@
 #include "Extension/Settings/engine_tweaks.h"
 #include "Extension/Settings/job_spin.h"
 #include "Extension/UI/ui_pointer_skip.h"
+#include "Engine/Core/Debug/force_dump.h"
+#include "Engine/Core/Log/logging.h"
 #include <format>
+#include <thread>
 
 // The performance profiler's console commands (Engine/Core/Profiling/profiler.h). Everything but
 // the saved HUD switch runs on the overlay's thread: the profiler is thread-safe.
@@ -238,5 +241,57 @@ void register_perf_commands(Commands& registry) {
     status.execution = Execution::local;
     status.run = [](const Model&, const Values&, const Output& out) { print_summary(out); };
     registry.add(std::move(status));
+
+    auto dump_kind = argument("mini|full", Type::text, true);
+    dump_kind.choices = {"mini", "full"};
+    auto dump_action = action("dump", "Write a process memory minidump or full dump to logs", Group::console, {dump_kind});
+    dump_action.execution = Execution::local;
+    dump_action.run = [](const Model&, const Values& args, const Output& out) {
+        bool full = false;
+        if (!args.empty()) {
+            const auto& val = std::get<std::string>(args[0]);
+            if (equal(val, "full")) full = true;
+        }
+        out(std::format("Capturing {} memory dump of Skate.exe in background...", full ? "FULL" : "MINI"));
+        std::thread([full, out]() {
+            const auto logs_dir = !logging::status().directory.empty()
+                ? logging::status().directory
+                : logging::log_directory(std::filesystem::current_path());
+            const auto result = debug::write_process_dump(GetCurrentProcess(), GetCurrentProcessId(), logs_dir,
+                full ? debug::DumpKind::full : debug::DumpKind::mini);
+            if (result.success) {
+                const double mb = static_cast<double>(result.size_bytes) / (1024.0 * 1024.0);
+                out(std::format("Process dump saved: {} ({:.2f} MB)", result.path.string(), mb));
+            } else {
+                out(std::format("Process dump failed: {}", result.error));
+            }
+        }).detach();
+    };
+    registry.add(std::move(dump_action));
+
+    auto dump_process_action = action("dump process", "Write a process memory minidump or full dump to logs", Group::console, {dump_kind});
+    dump_process_action.execution = Execution::local;
+    dump_process_action.run = [](const Model&, const Values& args, const Output& out) {
+        bool full = false;
+        if (!args.empty()) {
+            const auto& val = std::get<std::string>(args[0]);
+            if (equal(val, "full")) full = true;
+        }
+        out(std::format("Capturing {} memory dump of Skate.exe in background...", full ? "FULL" : "MINI"));
+        std::thread([full, out]() {
+            const auto logs_dir = !logging::status().directory.empty()
+                ? logging::status().directory
+                : logging::log_directory(std::filesystem::current_path());
+            const auto result = debug::write_process_dump(GetCurrentProcess(), GetCurrentProcessId(), logs_dir,
+                full ? debug::DumpKind::full : debug::DumpKind::mini);
+            if (result.success) {
+                const double mb = static_cast<double>(result.size_bytes) / (1024.0 * 1024.0);
+                out(std::format("Process dump saved: {} ({:.2f} MB)", result.path.string(), mb));
+            } else {
+                out(std::format("Process dump failed: {}", result.error));
+            }
+        }).detach();
+    };
+    registry.add(std::move(dump_process_action));
 }
 } // namespace dingosdk::console

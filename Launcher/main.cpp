@@ -14,6 +14,9 @@
 #include <string_view>
 #include <vector>
 
+#include "Engine/Core/Debug/force_dump.h"
+#include <cstdio>
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -97,6 +100,88 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         const auto result = dingosdk::backtrace::run_reporter(argc, argv);
         LocalFree(argv);
         return result;
+    }
+    if (argc > 1) {
+        std::wstring_view first(argv[1]);
+        if (first == L"--dump" || first == L"--dump-process" || first == L"--dump-full" || first == L"--dump-mini" || first == L"-d") {
+            const bool attached = AttachConsole(ATTACH_PARENT_PROCESS);
+            FILE* dummy_out{};
+            FILE* dummy_err{};
+            if (attached) {
+                freopen_s(&dummy_out, "CONOUT$", "w", stdout);
+                freopen_s(&dummy_err, "CONOUT$", "w", stderr);
+            }
+            const auto print = [&](const std::string& msg, bool is_error = false) {
+                if (attached) {
+                    std::fprintf(is_error ? stderr : stdout, "%s\n", msg.c_str());
+                    std::fflush(is_error ? stderr : stdout);
+                } else {
+                    MessageBoxW(nullptr, widen(msg).c_str(), L"ReSkate Dump", (is_error ? MB_ICONERROR : MB_ICONINFORMATION) | MB_OK);
+                }
+            };
+
+            bool full = (first == L"--dump-full");
+            DWORD target_pid = 0;
+            for (int i = 2; i < argc; ++i) {
+                std::wstring_view arg(argv[i]);
+                if (arg == L"full") {
+                    full = true;
+                } else if (arg == L"mini") {
+                    full = false;
+                } else {
+                    wchar_t* end{};
+                    auto val = wcstoul(argv[i], &end, 10);
+                    if (val > 0 && (!end || !*end)) {
+                        target_pid = val;
+                    }
+                }
+            }
+
+            if (target_pid == 0) {
+                target_pid = dingosdk::debug::find_skate_process_id();
+            }
+
+            if (target_pid == 0) {
+                print("Error: No running Skate.exe process was found to dump.", true);
+                LocalFree(argv);
+                return 1;
+            }
+
+            HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE, FALSE, target_pid);
+            if (!proc) {
+                proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, target_pid);
+            }
+            if (!proc) {
+                print(std::format("Error: Could not open Skate.exe (PID {}): Windows error code {}. Try running as Administrator.", target_pid, GetLastError()), true);
+                LocalFree(argv);
+                return 1;
+            }
+
+            fs::path dump_dir;
+            try {
+                const auto session = app::open_session("info");
+                dump_dir = session.paths.logs;
+            } catch (...) {
+                dump_dir = fs::current_path() / L"logs";
+            }
+
+            const auto result = dingosdk::debug::write_process_dump(proc, target_pid, dump_dir,
+                full ? dingosdk::debug::DumpKind::full : dingosdk::debug::DumpKind::mini);
+            CloseHandle(proc);
+
+            if (!result.success) {
+                print(std::format("Error: Failed to write dump: {}", result.error), true);
+                LocalFree(argv);
+                return 1;
+            }
+
+            const double size_mb = static_cast<double>(result.size_bytes) / (1024.0 * 1024.0);
+            print(std::format("Successfully wrote {} process dump for Skate.exe (PID {}) to:\n  {}\n  Size: {:.2f} MB",
+                (full ? "FULL" : "MINI"), target_pid, result.path.string(), size_mb));
+
+            LocalFree(argv);
+            return 0;
+        }
     }
     const std::vector<std::wstring> original(argv + 1, argv + argc);
     LocalFree(argv);

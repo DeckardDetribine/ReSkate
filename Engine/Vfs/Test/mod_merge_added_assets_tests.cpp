@@ -311,12 +311,13 @@ struct Fixture {
         fb::BundleAsset asset;
         Bytes payload;
     };
-    std::optional<MergedAsset> merged_asset(const std::string& relative, fb::AssetKind kind, const std::string& name) const {
+    std::optional<MergedAsset> merged_asset(const std::string& relative, fb::AssetKind kind, const std::string& name,
+                                            const std::string& targetBundle = bundle_name) const {
         const auto tocPath = catalog.root / mods::generated_folder / "Win32" / fs::path(relative);
         if (!fs::exists(tocPath)) return std::nullopt;
         const auto doc = fb::read_toc(read(tocPath));
         for (const auto& bundle : doc.bundles) {
-            if (bundle.name != bundle_name) continue;
+            if (bundle.name != targetBundle) continue;
             const auto region = fb::read_bundle_region(bundle.region);
             fb::BinaryBundle manifest;
             std::size_t fileOffset = 0;
@@ -576,6 +577,9 @@ void changed_resource_replaces_base_resource_in_maps_copy() {
 // When map's copy is merged, it must receive:
 // test/song, test/wave, res/audio_stream, and chunk 0x88.
 void transitive_structured_dependencies_follow_selected_ebx() {
+    // Non-level TOCs retain selective dependency forwarding.
+    constexpr char selective_toc[] = "test_map.toc";
+    constexpr char selective_superbundle[] = "Win32/test_map";
     Fixture fixture("transitive-deps");
 
     const auto songGuid = guid(0xA1);
@@ -616,33 +620,33 @@ void transitive_structured_dependencies_follow_selected_ebx() {
                 {audioStreamRes, unrelatedRes},
                 {{chunkGuid, chunkPayload}, {unrelatedChunkGuid, unrelatedChunkPayload}});
 
-    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+    fixture.add("map", true, selective_toc, {selective_superbundle}, game_copy());
 
     const auto report = mods::merge_mods(fixture.catalog);
     expect(report.issue.empty() && report.built, "transitive deps: merge builds patch\n" + describe(report));
 
-    const auto song = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/song");
+    const auto song = fixture.merged_asset(selective_toc, fb::AssetKind::ebx, "test/song");
     expect(song.has_value(), "transitive deps: map copy receives imported test/song");
 
-    const auto wave = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/wave");
+    const auto wave = fixture.merged_asset(selective_toc, fb::AssetKind::ebx, "test/wave");
     expect(wave.has_value(), "transitive deps: map copy receives transitively imported test/wave");
 
-    const auto stream = fixture.merged_asset(map_toc, fb::AssetKind::resource, "res/audio_stream");
+    const auto stream = fixture.merged_asset(selective_toc, fb::AssetKind::resource, "res/audio_stream");
     expect(stream.has_value(), "transitive deps: map copy receives referenced res/audio_stream");
 
-    const auto chunk = fixture.merged_chunk(map_toc, chunkGuid);
+    const auto chunk = fixture.merged_chunk(selective_toc, chunkGuid);
     expect(chunk.has_value(), "transitive deps: map copy receives chunk 0x88 from resource");
     if (chunk) {
         expect(chunk->second == chunkPayload, "transitive deps: chunk 0x88 payload matches");
     }
 
-    const auto unrelatedEbx = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/unrelated");
+    const auto unrelatedEbx = fixture.merged_asset(selective_toc, fb::AssetKind::ebx, "test/unrelated");
     expect(!unrelatedEbx.has_value(), "transitive deps: unreferenced test/unrelated is NOT merged");
 
-    const auto unrelatedResource = fixture.merged_asset(map_toc, fb::AssetKind::resource, "res/unrelated");
+    const auto unrelatedResource = fixture.merged_asset(selective_toc, fb::AssetKind::resource, "res/unrelated");
     expect(!unrelatedResource.has_value(), "transitive deps: unreferenced res/unrelated is NOT merged");
 
-    const auto unrelatedChunk = fixture.merged_chunk(map_toc, unrelatedChunkGuid);
+    const auto unrelatedChunk = fixture.merged_chunk(selective_toc, unrelatedChunkGuid);
     expect(!unrelatedChunk.has_value(), "transitive deps: unreferenced chunk is NOT merged");
 }
 
@@ -815,6 +819,53 @@ void bounded_diagnostics_report_merge_decisions() {
     const auto playlistAsset = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/playlist");
     expect(playlistAsset.has_value(), "diagnostics: updated test/playlist is readable from bundle");
 }
+
+void level_without_matching_bundles_receives_asset_mod_chunks() {
+    Fixture fixture("level-independent-chunks");
+    const auto chunkGuid = guid(0xD1);
+    const Bytes payload{std::byte{0x11}, std::byte{0x22}, std::byte{0x33}};
+    const Bytes lowerPriority{std::byte{0x44}};
+    // Neither donor changes an asset or adds a dependency to a bundle.
+    fixture.add("cosmetic", false, shared_toc, {}, game_copy(), {}, {{chunkGuid, payload}});
+    fixture.add("other-cosmetic", false, shared_toc, {}, game_copy(), {}, {{chunkGuid, lowerPriority}});
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+    const auto mapPath = fixture.catalog.mods.back().directory / "Win32" / map_toc;
+    auto level = fb::read_toc(read(mapPath));
+    level.bundles.front().name = "win32/test/level_only";
+    write(mapPath, fb::write_patch_toc(level.bundles, level.chunks));
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.built && report.issue.empty(), "level chunks: merge succeeds\n" + describe(report));
+    const auto chunk = fixture.merged_chunk(map_toc, chunkGuid);
+    expect(chunk.has_value(), "level chunks: TOC without matching bundles receives cosmetic chunk");
+    if (chunk) expect(chunk->second == payload, "level chunks: shifted archive reads highest-priority payload");
+    const auto merged = fb::read_toc(read(fixture.catalog.root / mods::generated_folder / "Win32" / map_toc));
+    expect(std::ranges::count_if(merged.chunks, [&](const auto& c) { return c.guid == chunkGuid; }) == 1,
+           "level chunks: duplicate GUID is published once");
+}
+
+void changed_asset_does_not_override_different_bundle() {
+    Fixture fixture("changed-different-bundle");
+    // Mod A changes test/playlist in win32/test/shared.
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {})},
+                 {"test/other", 0, ebx_document(guid(2), {})}});
+    // Map has a custom bundle "win32/test/level_only" containing test/playlist with version 0.
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+    const auto mapPath = fixture.catalog.mods.back().directory / "Win32" / map_toc;
+    auto level = fb::read_toc(read(mapPath));
+    level.bundles.front().name = "win32/test/level_only";
+    write(mapPath, fb::write_patch_toc(level.bundles, level.chunks));
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.built && report.issue.empty(), "different bundle: merge succeeds\n" + describe(report));
+    const auto asset = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/playlist", "win32/test/level_only");
+    expect(asset.has_value(), "different bundle: level bundle contains test/playlist");
+    if (asset) {
+        expect(asset->asset.sha1 == sha("test/playlist", 0),
+               "different bundle: asset in distinct bundle is NOT overwritten by foreign bundle change");
+    }
+}
 } // namespace
 
 int main() try {
@@ -828,11 +879,13 @@ int main() try {
     changed_ebx_carries_its_chunks_into_maps_copy();
     changed_chunk_retaining_existing_guid_propagates();
     changed_resource_replaces_base_resource_in_maps_copy();
+    changed_asset_does_not_override_different_bundle();
     transitive_structured_dependencies_follow_selected_ebx();
     transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members();
     unreadable_chunk_dependency_retains_prior_asset_version();
     unreadable_chunk_dependency_aborts_asset_addition();
     bounded_diagnostics_report_merge_decisions();
+    level_without_matching_bundles_receives_asset_mod_chunks();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

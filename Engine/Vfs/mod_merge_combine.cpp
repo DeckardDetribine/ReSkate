@@ -250,7 +250,7 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
         const auto gridBundle = !grid.payload.empty() && key == grid.bundle;
         const auto renumber = !isBase && grid.rewrites(modName);
         // A mod's copies of assets another mod changed take that change.
-        const auto propagate = !isBase && !overrides.empty();
+        const auto propagate = !isBase && (overrides.changed.contains(key) || overrides.added.contains(key));
         // Reading the manifest only to look for such copies is optional: a
         // bundle that cannot be read that way just passes through as it is.
         const auto needed = shared || gridBundle || renumber;
@@ -398,43 +398,45 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
         // goes into the merged patch, next to this bundle's other files.
         std::map<std::size_t, fb::BundleFileInfo> overridden;
         if (propagate && casBacked) {
-            std::string example;
-            const auto apply_overrides = [&](std::vector<fb::BundleAsset>& assets, std::size_t fileBase) {
-                for (std::size_t index = 0; index < assets.size(); ++index) {
-                    auto& asset = assets[index];
-                    const auto named = overrides.changed.find(asset_key(asset));
-                    if (named == overrides.changed.end()) continue;
-                    const auto change = named->second.find(asset.sha1);
-                    const auto at = fileBase + index;
-                    if (change == named->second.end() || change->second.mod == modName || at >= region.files.size())
-                        continue;
-                    try {
-                        validate_chunks(change->second.chunks);
-                        overridden[at] = store.write(region.files[at].location.installChunk, manifestArchive,
-                                                     change->second.encoded);
-                        asset.sha1 = change->second.asset.sha1;
-                        asset.originalSize = change->second.asset.originalSize;
-                        if (asset.kind == fb::AssetKind::resource) {
-                            asset.resourceId = change->second.asset.resourceId;
-                            asset.resourceType = change->second.asset.resourceType;
-                            asset.resourceMeta = change->second.asset.resourceMeta;
+            if (const auto bundleChanged = overrides.changed.find(key); bundleChanged != overrides.changed.end()) {
+                std::string example;
+                const auto apply_overrides = [&](std::vector<fb::BundleAsset>& assets, std::size_t fileBase) {
+                    for (std::size_t index = 0; index < assets.size(); ++index) {
+                        auto& asset = assets[index];
+                        const auto named = bundleChanged->second.find(asset_key(asset));
+                        if (named == bundleChanged->second.end()) continue;
+                        const auto change = named->second.find(asset.sha1);
+                        const auto at = fileBase + index;
+                        if (change == named->second.end() || change->second.mod == modName || at >= region.files.size())
+                            continue;
+                        try {
+                            validate_chunks(change->second.chunks);
+                            overridden[at] = store.write(region.files[at].location.installChunk, manifestArchive,
+                                                         change->second.encoded);
+                            asset.sha1 = change->second.asset.sha1;
+                            asset.originalSize = change->second.asset.originalSize;
+                            if (asset.kind == fb::AssetKind::resource) {
+                                asset.resourceId = change->second.asset.resourceId;
+                                asset.resourceType = change->second.asset.resourceType;
+                                asset.resourceMeta = change->second.asset.resourceMeta;
+                            }
+                            for (const auto& chunk : change->second.chunks)
+                                forwardedChunks.push_back({chunk, change->second.mod});
+                            if (example.empty()) example = asset.name + " from " + change->second.mod;
+                        } catch (const std::exception& error) {
+                            const std::string text = bundle.name + ": " + asset.name +
+                                " kept the game's copy, the change could not be copied (" + error.what() + ")";
+                            report.notes.push_back(modName + ": " + text);
+                            report.problems[change->second.mod].push_back(text);
                         }
-                        for (const auto& chunk : change->second.chunks)
-                            forwardedChunks.push_back({chunk, change->second.mod});
-                        if (example.empty()) example = asset.name + " from " + change->second.mod;
-                    } catch (const std::exception& error) {
-                        const std::string text = bundle.name + ": " + asset.name +
-                            " kept the game's copy, the change could not be copied (" + error.what() + ")";
-                        report.notes.push_back(modName + ": " + text);
-                        report.problems[change->second.mod].push_back(text);
                     }
-                }
-            };
-            apply_overrides(casManifest.ebx, 1);
-            apply_overrides(casManifest.resources, 1 + casManifest.ebx.size());
-            if (!overridden.empty())
-                report.notes.push_back(modName + ": " + bundle.name + ": " + std::to_string(overridden.size()) +
-                    " asset(s) take another mod's change, e.g. " + example);
+                };
+                apply_overrides(casManifest.ebx, 1);
+                apply_overrides(casManifest.resources, 1 + casManifest.ebx.size());
+                if (!overridden.empty())
+                    report.notes.push_back(modName + ": " + bundle.name + ": " + std::to_string(overridden.size()) +
+                        " asset(s) take another mod's change, e.g. " + example);
+            }
         }
         // Assets another mod added to the game's copy of this bundle: this copy
         // loads instead of the game's on this mod's levels, so it gets them too.
@@ -855,6 +857,24 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
             }
             chunkAt.emplace(chunk.guid, merged.chunks.size());
             merged.chunks.push_back(chunk);
+        }
+    }
+    // Cosmetic streaming can request chunks without touching any bundle here.
+    // Only level TOCs get all asset-mod chunks; other TOCs keep dependency filtering.
+    if (lower(relative).find("levels/") != std::string::npos) {
+        std::set<fb::Guid> forwarded;
+        for (const auto& modChunk : overrides.modChunks) {
+            if (forwarded.contains(modChunk.chunk.guid)) continue;
+            try {
+                // Do not publish an entry whose shifted archive payload cannot be read.
+                (void)store.read(store.output(), modChunk.chunk.location,
+                                 modChunk.chunk.offset, modChunk.chunk.size);
+                forwardedChunks.push_back({modChunk.chunk, modChunk.mod});
+                forwarded.insert(modChunk.chunk.guid);
+            } catch (const std::exception& failure) {
+                report.notes.push_back(relative + ": unreadable chunk " + modChunk.chunk.guid.string() +
+                    " from " + modChunk.mod + " was not forwarded (" + failure.what() + ")");
+            }
         }
     }
     // This superbundle resolves chunks from its own TOC: chunks referenced by

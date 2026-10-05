@@ -108,7 +108,7 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                             candidates.push_back({lower(bundle.name), {mod->name, asset, payload(), lower(relative)}});
                             continue;
                         }
-                        auto& versions = out.changed[asset_key(asset)];
+                        auto& versions = out.changed[lower(bundle.name)][asset_key(asset)];
                         if (versions.contains(game_copy->second)) continue;
                         const auto& change = versions.emplace(game_copy->second,
                             AssetOverride{mod->name, asset, payload()}).first->second;
@@ -142,7 +142,7 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                                           gameRes->second->resourceId == asset.resourceId &&
                                           gameRes->second->resourceMeta == asset.resourceMeta;
                         if (same) continue;
-                        auto& versions = out.changed[asset_key(asset)];
+                        auto& versions = out.changed[lower(bundle.name)][asset_key(asset)];
                         if (versions.contains(gameRes->second->sha1)) continue;
                         versions.emplace(gameRes->second->sha1, AssetOverride{mod->name, asset, payload()});
                         ++changed;
@@ -153,6 +153,9 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                     ": its changes could not be read for other mods' copies (" + failure.what() + ")");
             }
         }
+        for (const auto& chunk : newChunks)
+            out.modChunks.push_back({mod->name, chunk});
+
         // One addition per kind and name in a bundle, the highest-priority mod's. Two
         // mods adding the same asset is no clash; two different assets under one name
         // is, and only one of them can be what a copy gets: say whose, so a song or an
@@ -228,8 +231,9 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
         // so only successfully propagated changes bring their required chunks.
         if (!newChunks.empty()) {
             std::set<fb::Guid> taken;
-            for (auto& [name, versions] : out.changed) {
-                for (auto& [sha1, change] : versions) {
+            for (auto& [bundleName, bundleChanged] : out.changed) {
+                for (auto& [name, versions] : bundleChanged) {
+                    for (auto& [sha1, change] : versions) {
                     if (change.mod != mod->name) continue;
                     try {
                         const auto decodedPayload = fb::decode_cas(change.encoded, {gameRoot});
@@ -245,7 +249,8 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                     } catch (const std::exception&) {}
                 }
             }
-            for (auto& [bundle, list] : out.added) {
+        }
+        for (auto& [bundle, list] : out.added) {
                 for (auto& addition : list) {
                     if (addition.mod != mod->name || (addition.asset.kind != fb::AssetKind::ebx && addition.asset.kind != fb::AssetKind::resource)) continue;
                     try {
