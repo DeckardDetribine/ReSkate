@@ -796,6 +796,24 @@ void bounded_diagnostics_report_merge_decisions() {
         return note.find("copied") != std::string::npos && note.find("chunk(s)") != std::string::npos;
     });
     expect(copiedNoted, "diagnostics: records chunk copied note\n" + describe(report));
+
+    // Verify output integrity: replaced chunk reads mod payload from generated patch archive
+    const auto replacedChunk = fixture.merged_chunk(map_toc, existingChunkGuid);
+    expect(replacedChunk.has_value(), "diagnostics: replaced chunk is in map TOC");
+    if (replacedChunk) {
+        expect(replacedChunk->second == modChunkPayload, "diagnostics: replaced chunk matches donor payload");
+    }
+
+    // Verify output integrity: copied chunk reads new chunk payload from generated patch archive
+    const auto copiedChunk = fixture.merged_chunk(map_toc, newChunkGuid);
+    expect(copiedChunk.has_value(), "diagnostics: copied chunk is in map TOC");
+    if (copiedChunk) {
+        expect(copiedChunk->second == newChunkPayload, "diagnostics: copied chunk matches donor payload");
+    }
+
+    // Verify output integrity: destination EBX was updated and readable
+    const auto playlistAsset = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/playlist");
+    expect(playlistAsset.has_value(), "diagnostics: updated test/playlist is readable from bundle");
 }
 } // namespace
 
