@@ -838,7 +838,15 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
     // assets applied to bundles copied here have to be listed here as well.
     std::map<std::string, std::size_t> forwardedCountByMod;
     for (const auto& [chunk, mod] : forwardedChunks) {
-        if (!chunkAt.emplace(chunk.guid, merged.chunks.size()).second) continue;
+        const auto at = chunkAt.find(chunk.guid);
+        if (at != chunkAt.end()) {
+            if (same(merged.chunks[at->second], chunk)) continue;
+            merged.chunks[at->second] = chunk;
+            used.emplace(chunk.location.installChunk, chunk.location.archive);
+            ++forwardedCountByMod[mod];
+            continue;
+        }
+        chunkAt.emplace(chunk.guid, merged.chunks.size());
         merged.chunks.push_back(chunk);
         used.emplace(chunk.location.installChunk, chunk.location.archive);
         ++forwardedCountByMod[mod];

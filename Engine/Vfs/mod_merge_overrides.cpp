@@ -40,10 +40,28 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                 const auto game = fb::read_toc(read_file(baseToc));
                 std::map<std::string, const fb::TocBundle*, std::less<>> gameBundles;
                 for (const auto& bundle : game.bundles) gameBundles.emplace(lower(bundle.name), &bundle);
-                std::set<fb::Guid> gameChunks;
-                for (const auto& chunk : game.chunks) gameChunks.insert(chunk.guid);
-                for (const auto& chunk : own.chunks)
-                    if (!chunk.removed && chunk.location.patch && !gameChunks.contains(chunk.guid)) newChunks.push_back(chunk);
+                const auto chunk_changed = [&](const fb::TocChunk& modChunk, const fb::TocChunk& baseChunk) {
+                    if (modChunk.size != baseChunk.size) return true;
+                    if (modChunk.location == baseChunk.location && modChunk.offset == baseChunk.offset) return false;
+                    try {
+                        const auto modBytes = store.read(modChunk.location.patch ? mod->directory : baseRoot,
+                                                         modChunk.location, modChunk.offset, modChunk.size);
+                        const auto gameBytes = store.read(baseRoot, baseChunk.location, baseChunk.offset, baseChunk.size);
+                        return modBytes != gameBytes;
+                    } catch (const std::exception&) {
+                        return true;
+                    }
+                };
+                std::map<fb::Guid, const fb::TocChunk*> gameChunks;
+                for (const auto& chunk : game.chunks) gameChunks.emplace(chunk.guid, &chunk);
+                for (const auto& chunk : own.chunks) {
+                    if (chunk.removed || !chunk.location.patch) continue;
+                    const auto shipped = gameChunks.find(chunk.guid);
+                    if (shipped == gameChunks.end() || chunk_changed(chunk, *shipped->second)) {
+                        if (std::find_if(newChunks.begin(), newChunks.end(), [&](const auto& c) { return c.guid == chunk.guid; }) == newChunks.end())
+                            newChunks.push_back(chunk);
+                    }
+                }
                 for (const auto& bundle : own.bundles) {
                     const auto shipped = gameBundles.find(lower(bundle.name));
                     if (shipped == gameBundles.end()) continue;
