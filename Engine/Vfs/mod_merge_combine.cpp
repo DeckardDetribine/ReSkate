@@ -423,8 +423,10 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                             forwardedChunks.push_back({chunk, change->second.mod});
                         if (example.empty()) example = asset.name + " from " + change->second.mod;
                     } catch (const std::exception& error) {
-                        report.notes.push_back(modName + ": " + bundle.name + ": " + asset.name +
-                            " kept the game's copy, the change could not be copied (" + error.what() + ")");
+                        const std::string text = bundle.name + ": " + asset.name +
+                            " kept the game's copy, the change could not be copied (" + error.what() + ")";
+                        report.notes.push_back(modName + ": " + text);
+                        report.problems[change->second.mod].push_back(text);
                     }
                 }
             };
@@ -455,8 +457,10 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                         for (const auto& chunk : addition.chunks)
                             forwardedChunks.push_back({chunk, addition.mod});
                     } catch (const std::exception& error) {
-                        report.notes.push_back(modName + ": " + bundle.name + ": " + addition.asset.name +
-                            " from " + addition.mod + " could not be added (" + error.what() + ")");
+                        const std::string text = bundle.name + ": " + addition.asset.name +
+                            " from " + addition.mod + " could not be added (" + error.what() + ")";
+                        report.notes.push_back(modName + ": " + text);
+                        report.problems[addition.mod].push_back(text);
                     }
                 }
                 if (!additions.empty())
@@ -855,23 +859,39 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
     }
     // This superbundle resolves chunks from its own TOC: chunks referenced by
     // assets applied to bundles copied here have to be listed here as well.
-    std::map<std::string, std::size_t> forwardedCountByMod;
+    std::map<std::string, std::size_t> copiedChunks, replacedChunks, satisfiedChunks;
+    std::map<std::string, std::string> copiedExample, replacedExample, satisfiedExample;
     for (const auto& [chunk, mod] : forwardedChunks) {
         const auto at = chunkAt.find(chunk.guid);
         if (at != chunkAt.end()) {
-            if (same(merged.chunks[at->second], chunk)) continue;
+            if (same(merged.chunks[at->second], chunk)) {
+                auto& count = satisfiedChunks[mod];
+                if (!count++) satisfiedExample[mod] = chunk.guid.string();
+                continue;
+            }
             merged.chunks[at->second] = chunk;
             used.emplace(chunk.location.installChunk, chunk.location.archive);
-            ++forwardedCountByMod[mod];
+            auto& count = replacedChunks[mod];
+            if (!count++) replacedExample[mod] = chunk.guid.string();
             continue;
         }
         chunkAt.emplace(chunk.guid, merged.chunks.size());
         merged.chunks.push_back(chunk);
         used.emplace(chunk.location.installChunk, chunk.location.archive);
-        ++forwardedCountByMod[mod];
+        auto& count = copiedChunks[mod];
+        if (!count++) copiedExample[mod] = chunk.guid.string();
     }
-    for (const auto& [mod, count] : forwardedCountByMod) {
-        if (count) report.notes.push_back(relative + ": " + std::to_string(count) + " chunk(s) from " + mod);
+    for (const auto& [mod, count] : copiedChunks) {
+        report.notes.push_back(relative + ": copied " + std::to_string(count) + " chunk(s) from " + mod +
+                               ", e.g. " + copiedExample[mod]);
+    }
+    for (const auto& [mod, count] : replacedChunks) {
+        report.notes.push_back(relative + ": replaced " + std::to_string(count) + " chunk(s) with change from " + mod +
+                               ", e.g. " + replacedExample[mod]);
+    }
+    for (const auto& [mod, count] : satisfiedChunks) {
+        report.notes.push_back(relative + ": " + std::to_string(count) + " chunk(s) from " + mod +
+                               " already satisfied, e.g. " + satisfiedExample[mod]);
     }
 
     if (sources.size() > 1) {

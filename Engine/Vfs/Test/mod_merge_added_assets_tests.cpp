@@ -743,6 +743,60 @@ void unreadable_chunk_dependency_aborts_asset_addition() {
     const auto chunkResult = fixture.merged_chunk(map_toc, chunkGuid);
     expect(!chunkResult.has_value(), "unreadable chunk add: broken chunk is NOT in map TOC");
 }
+
+void bounded_diagnostics_report_merge_decisions() {
+    const auto existingChunkGuid = guid(0x11);
+    const Bytes baseChunkPayload{std::byte{0x10}, std::byte{0x20}};
+    const Bytes modChunkPayload{std::byte{0x99}, std::byte{0x88}};
+
+    const auto newChunkGuid = guid(0x33);
+    const Bytes newChunkPayload{std::byte{0x55}, std::byte{0x66}};
+
+    Fixture fixture("diagnostics-decisions",
+                    {{existingChunkGuid, baseChunkPayload}});
+
+    Bytes playlistData;
+    put_guid(playlistData, existingChunkGuid);
+    put_guid(playlistData, newChunkGuid);
+
+    Bytes otherData;
+    put_guid(otherData, newChunkGuid);
+
+    // patchmod modifies playlist and other:
+    // - existingChunkGuid with modChunkPayload (replaced)
+    // - newChunkGuid with newChunkPayload (first copied for playlist, then already satisfied for other)
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {}, playlistData)},
+                 {"test/other", 1, ebx_document(guid(2), {}, otherData)}},
+                {},
+                {{existingChunkGuid, modChunkPayload},
+                 {newChunkGuid, newChunkPayload}});
+
+    // map carries the base chunks
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy(), {},
+                {{existingChunkGuid, baseChunkPayload}});
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.built, "diagnostics: merge builds patch\n" + describe(report));
+
+    // Verify "replaced" note for modified chunk
+    const auto replacedNoted = std::ranges::any_of(report.notes, [](const std::string& note) {
+        return note.find("replaced") != std::string::npos && note.find("chunk(s)") != std::string::npos;
+    });
+    expect(replacedNoted, "diagnostics: records chunk replaced note\n" + describe(report));
+
+    // Verify "already satisfied" note for identical chunk
+    const auto satisfiedNoted = std::ranges::any_of(report.notes, [](const std::string& note) {
+        return note.find("already satisfied") != std::string::npos;
+    });
+    expect(satisfiedNoted, "diagnostics: records chunk already satisfied note\n" + describe(report));
+
+    // Verify "copied" / new chunk note
+    const auto copiedNoted = std::ranges::any_of(report.notes, [](const std::string& note) {
+        return note.find("copied") != std::string::npos && note.find("chunk(s)") != std::string::npos;
+    });
+    expect(copiedNoted, "diagnostics: records chunk copied note\n" + describe(report));
+}
 } // namespace
 
 int main() try {
@@ -760,6 +814,7 @@ int main() try {
     transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members();
     unreadable_chunk_dependency_retains_prior_asset_version();
     unreadable_chunk_dependency_aborts_asset_addition();
+    bounded_diagnostics_report_merge_decisions();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;
