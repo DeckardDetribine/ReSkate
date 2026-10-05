@@ -382,6 +382,18 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                     " collision resource(s) could not be renumbered, e.g. " + failure);
         }
 
+        const auto validate_chunks = [&](const std::vector<fb::TocChunk>& chunks) {
+            for (const auto& chunk : chunks) {
+                const auto chunkRoot = chunk.location.patch ? store.output() : store.root();
+                const auto size = store.archive_size(chunkRoot, chunk.location);
+                if (!size || static_cast<std::uint64_t>(chunk.offset) + chunk.size > *size) {
+                    throw std::runtime_error("required chunk " + chunk.guid.string() + " is unreadable in " +
+                                             store.describe(chunk.location));
+                }
+                (void)store.read(chunkRoot, chunk.location, chunk.offset, chunk.size);
+            }
+        };
+
         // The mod's unchanged copies of assets another mod changed: the change
         // goes into the merged patch, next to this bundle's other files.
         std::map<std::size_t, fb::BundleFileInfo> overridden;
@@ -397,6 +409,7 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                     if (change == named->second.end() || change->second.mod == modName || at >= region.files.size())
                         continue;
                     try {
+                        validate_chunks(change->second.chunks);
                         overridden[at] = store.write(region.files[at].location.installChunk, manifestArchive,
                                                      change->second.encoded);
                         asset.sha1 = change->second.asset.sha1;
@@ -436,6 +449,7 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                     if (addition.mod == modName || addition.asset.kind == fb::AssetKind::chunk ||
                         addition.toc == here || present.contains(asset_key(addition.asset))) continue;
                     try {
+                        validate_chunks(addition.chunks);
                         additions.push_back({addition.asset, store.write(region.files.front().location.installChunk,
                                                                          manifestArchive, addition.encoded)});
                         for (const auto& chunk : addition.chunks)

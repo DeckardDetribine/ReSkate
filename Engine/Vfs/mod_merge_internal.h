@@ -115,6 +115,8 @@ public:
     void shift(fb::CasIdentifier& location, std::uint32_t& offset,
                const ArchivePlacement* placement) const;
 
+    [[nodiscard]] const fs::path& output() const noexcept { return output_; }
+
 private:
     fs::path output_;
     std::map<std::wstring, std::uint64_t> offsets_;

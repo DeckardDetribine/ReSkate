@@ -247,7 +247,7 @@ struct Fixture {
     // A mod with its own copy of the bundle: the manifest first (raw), then every payload.
     void add(const std::string& name, bool levels, const std::string& toc, const std::vector<std::string>& superbundles,
              const std::vector<Ebx>& assets, const std::vector<Resource>& resources = {},
-             const std::vector<Chunk>& chunks = {}) {
+             const std::vector<Chunk>& chunks = {}, const std::vector<fb::TocChunk>& rawTocChunks = {}) {
         const auto listing = fb::write_binary_bundle(manifest_of(assets, resources));
         Bytes archive(listing);
         std::vector<fb::BundleFileInfo> files{{{true, package, 1}, 0, static_cast<std::uint32_t>(listing.size())}};
@@ -263,6 +263,7 @@ struct Fixture {
             toc_chunks.push_back({chunk.guid, {true, package, 1}, static_cast<std::uint32_t>(archive.size()), static_cast<std::uint32_t>(chunk.payload.size())});
             archive.insert(archive.end(), chunk.payload.begin(), chunk.payload.end());
         }
+        for (const auto& raw : rawTocChunks) toc_chunks.push_back(raw);
         const std::vector<fb::TocBundle> bundles{{bundle_name, fb::write_bundle_region(files), 1}};
         const auto directory = catalog.root / name;
         write(directory / "layout.toc", layout_toc(superbundles));
@@ -668,6 +669,80 @@ void transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members() {
     const auto b = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/nodeB");
     expect(b.has_value(), "cycle deps: map copy receives cyclic nodeB");
 }
+
+// If a mod changes an existing EBX to reference a chunk, but that chunk is unreadable
+// (corrupted, truncated, or invalid archive offset), the merger must not publish a broken asset.
+// Instead, the destination must retain the prior complete version (the game's original copy),
+// the unreadable chunk must not be registered in the destination TOC, and an explanatory note
+// must be recorded.
+void unreadable_chunk_dependency_retains_prior_asset_version() {
+    Fixture fixture("unreadable-chunk");
+
+    const auto chunkGuid = guid(0x99);
+    Bytes ebxData;
+    put_guid(ebxData, chunkGuid);
+
+    // Broken chunk pointing to byte 0x900000 in cas_01, far past the end of the file.
+    fb::TocChunk brokenChunk{chunkGuid, {true, package, 1}, 0x900000, 0x100, false};
+
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {}, ebxData)},
+                 {"test/other", 0, ebx_document(guid(2), {})}},
+                {},
+                {},
+                {brokenChunk});
+
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.built, "unreadable chunk: merge builds patch\n" + describe(report));
+
+    const auto assetResult = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/playlist");
+    expect(assetResult.has_value(), "unreadable chunk: destination has test/playlist");
+    if (assetResult) {
+        expect(assetResult->asset.sha1 == sha("test/playlist", 0),
+               "unreadable chunk: destination retains base game copy (version 0)");
+    }
+
+    const auto chunkResult = fixture.merged_chunk(map_toc, chunkGuid);
+    expect(!chunkResult.has_value(), "unreadable chunk: unreadable chunk is NOT registered in map TOC");
+
+    const auto noteFound = std::ranges::any_of(report.notes, [](const std::string& note) {
+        return note.find("test/playlist") != std::string::npos &&
+               (note.find("kept the game's copy") != std::string::npos || note.find("unreadable") != std::string::npos);
+    });
+    expect(noteFound, "unreadable chunk: explanatory note is recorded");
+}
+
+void unreadable_chunk_dependency_aborts_asset_addition() {
+    Fixture fixture("unreadable-chunk-add");
+
+    const auto songGuid = guid(0x55);
+    const auto chunkGuid = guid(0x66);
+    Bytes songData;
+    put_guid(songData, chunkGuid);
+
+    fb::TocChunk brokenChunk{chunkGuid, {true, package, 1}, 0x900000, 0x100, false};
+
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {songGuid})},
+                 {"test/other", 0, ebx_document(guid(2), {})},
+                 {"test/song", 0, ebx_document(songGuid, {}, songData)}},
+                {},
+                {},
+                {brokenChunk});
+
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.built, "unreadable chunk add: merge builds patch\n" + describe(report));
+
+    const auto songResult = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/song");
+    expect(!songResult.has_value(), "unreadable chunk add: test/song is NOT added to destination");
+
+    const auto chunkResult = fixture.merged_chunk(map_toc, chunkGuid);
+    expect(!chunkResult.has_value(), "unreadable chunk add: broken chunk is NOT in map TOC");
+}
 } // namespace
 
 int main() try {
@@ -683,6 +758,8 @@ int main() try {
     changed_resource_replaces_base_resource_in_maps_copy();
     transitive_structured_dependencies_follow_selected_ebx();
     transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members();
+    unreadable_chunk_dependency_retains_prior_asset_version();
+    unreadable_chunk_dependency_aborts_asset_addition();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;
