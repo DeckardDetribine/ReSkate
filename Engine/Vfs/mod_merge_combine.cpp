@@ -232,8 +232,12 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
         std::string example;
     };
     std::map<std::string, ArchiveFault> archiveFaults;
-    // Mods whose added assets went into a copy here: their added chunks come too.
-    std::set<std::string> addedFrom;
+    // Chunks referenced by overrides and additions applied to bundles in this superbundle.
+    struct ForwardedChunk {
+        fb::TocChunk chunk;
+        std::string mod;
+    };
+    std::vector<ForwardedChunk> forwardedChunks;
     // The mods absorbed so far, so each asset can say whose copy it is.
     std::set<std::string> owners;
 
@@ -400,6 +404,8 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                                                  change->second.encoded);
                     asset.sha1 = change->second.sha1;
                     asset.originalSize = change->second.originalSize;
+                    for (const auto& chunk : change->second.chunks)
+                        forwardedChunks.push_back({chunk, change->second.mod});
                     if (example.empty()) example = asset.name + " from " + change->second.mod;
                 } catch (const std::exception& error) {
                     report.notes.push_back(modName + ": " + bundle.name + ": " + asset.name +
@@ -427,7 +433,8 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
                     try {
                         additions.push_back({addition.asset, store.write(region.files.front().location.installChunk,
                                                                          manifestArchive, addition.encoded)});
-                        addedFrom.insert(addition.mod);
+                        for (const auto& chunk : addition.chunks)
+                            forwardedChunks.push_back({chunk, addition.mod});
                     } catch (const std::exception& error) {
                         report.notes.push_back(modName + ": " + bundle.name + ": " + addition.asset.name +
                             " from " + addition.mod + " could not be added (" + error.what() + ")");
@@ -827,19 +834,17 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
             merged.chunks.push_back(chunk);
         }
     }
-    // This superbundle resolves chunks from its own TOC: the audio of a song another
-    // mod added to a bundle copied here has to be listed here as well.
-    for (const auto& name : addedFrom) {
-        const auto found = overrides.chunks.find(name);
-        if (found == overrides.chunks.end()) continue;
-        std::size_t listed{};
-        for (const auto& chunk : found->second) {
-            if (!chunkAt.emplace(chunk.guid, merged.chunks.size()).second) continue;
-            merged.chunks.push_back(chunk);
-            used.emplace(chunk.location.installChunk, chunk.location.archive);
-            ++listed;
-        }
-        if (listed) report.notes.push_back(relative + ": " + std::to_string(listed) + " chunk(s) from " + name);
+    // This superbundle resolves chunks from its own TOC: chunks referenced by
+    // assets applied to bundles copied here have to be listed here as well.
+    std::map<std::string, std::size_t> forwardedCountByMod;
+    for (const auto& [chunk, mod] : forwardedChunks) {
+        if (!chunkAt.emplace(chunk.guid, merged.chunks.size()).second) continue;
+        merged.chunks.push_back(chunk);
+        used.emplace(chunk.location.installChunk, chunk.location.archive);
+        ++forwardedCountByMod[mod];
+    }
+    for (const auto& [mod, count] : forwardedCountByMod) {
+        if (count) report.notes.push_back(relative + ": " + std::to_string(count) + " chunk(s) from " + mod);
     }
 
     if (sources.size() > 1) {

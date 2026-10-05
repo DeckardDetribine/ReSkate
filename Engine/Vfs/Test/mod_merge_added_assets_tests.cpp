@@ -21,7 +21,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -74,7 +76,7 @@ void chunk(Bytes& out, const char (&id)[5], const Bytes& body) {
     out.insert(out.end(), body.begin(), body.end());
     if (body.size() & 1) out.push_back(std::byte{0});
 }
-Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports) {
+Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports, const Bytes& customData = {}) {
     Bytes fixup;
     put_guid(fixup, file);
     for (int i = 0; i < 6; ++i) put32(fixup, 0);   // types, signatures, exported, instances, pointers, resource refs
@@ -85,7 +87,7 @@ Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports) {
     }
     for (int i = 0; i < 2; ++i) put32(fixup, 0);   // import relocations, type-info references
     for (int i = 0; i < 3; ++i) put32(fixup, 0);   // array, boxed-value and string sections
-    const Bytes data(16);
+    const Bytes data = customData.empty() ? Bytes(16) : customData;
     Bytes extra;
     put32(extra, 0);                               // arrays
     put32(extra, 0);                               // boxed values
@@ -211,9 +213,12 @@ struct Fixture {
         fs::remove_all(root, ignored);
     }
 
+    struct Chunk { fb::Guid guid; Bytes payload; };
+
     // A mod with its own copy of the bundle: the manifest first (raw), then every payload.
     void add(const std::string& name, bool levels, const std::string& toc, const std::vector<std::string>& superbundles,
-             const std::vector<Ebx>& assets, const std::vector<Resource>& resources = {}) {
+             const std::vector<Ebx>& assets, const std::vector<Resource>& resources = {},
+             const std::vector<Chunk>& chunks = {}) {
         const auto listing = fb::write_binary_bundle(manifest_of(assets, resources));
         Bytes archive(listing);
         std::vector<fb::BundleFileInfo> files{{{true, package, 1}, 0, static_cast<std::uint32_t>(listing.size())}};
@@ -224,10 +229,15 @@ struct Fixture {
         };
         for (const auto& asset : assets) store(asset.payload);
         for (const auto& resource : resources) store(resource.payload);
+        std::vector<fb::TocChunk> toc_chunks;
+        for (const auto& chunk : chunks) {
+            toc_chunks.push_back({chunk.guid, {true, package, 1}, static_cast<std::uint32_t>(archive.size()), static_cast<std::uint32_t>(chunk.payload.size())});
+            archive.insert(archive.end(), chunk.payload.begin(), chunk.payload.end());
+        }
         const std::vector<fb::TocBundle> bundles{{bundle_name, fb::write_bundle_region(files), 1}};
         const auto directory = catalog.root / name;
         write(directory / "layout.toc", layout_toc(superbundles));
-        write(directory / "Win32" / fs::path(toc), fb::write_patch_toc(bundles));
+        write(directory / "Win32" / fs::path(toc), fb::write_patch_toc(bundles, toc_chunks));
         write(directory / "Win32" / "pkg" / "cas_01.cas", archive);
         mods::Mod mod;
         mod.name = name;
@@ -244,6 +254,25 @@ struct Fixture {
         for (const auto& bundle : fb::read_toc(read(toc)).bundles)
             if (bundle.name == bundle_name) return static_cast<int>(fb::read_bundle_region(bundle.region).files.size());
         return -1;
+    }
+
+    std::optional<std::pair<fb::TocChunk, Bytes>> merged_chunk(const std::string& relative, const fb::Guid& guid) const {
+        const auto tocPath = catalog.root / mods::generated_folder / "Win32" / fs::path(relative);
+        if (!fs::exists(tocPath)) return std::nullopt;
+        const auto doc = fb::read_toc(read(tocPath));
+        for (const auto& chunk : doc.chunks) {
+            if (chunk.guid == guid) {
+                const auto archiveFile = "cas_" + (chunk.location.archive < 10 ? std::string("0") : std::string{}) +
+                                         std::to_string(chunk.location.archive) + ".cas";
+                const auto archivePath = catalog.root / mods::generated_folder / "Win32" / "pkg" / fs::path(archiveFile);
+                if (!fs::exists(archivePath)) return std::make_pair(chunk, Bytes{});
+                const auto archive = read(archivePath);
+                if (chunk.offset + chunk.size > archive.size()) return std::make_pair(chunk, Bytes{});
+                Bytes payload(archive.begin() + chunk.offset, archive.begin() + chunk.offset + chunk.size);
+                return std::make_pair(chunk, std::move(payload));
+            }
+        }
+        return std::nullopt;
     }
 };
 
@@ -353,6 +382,31 @@ void same_name_from_two_mods(bool different) {
     expect(noted(report, std::string("map: ") + bundle_name + ": 3 asset(s) added by other mods, e.g. test/song"),
            label + ": the map's copy still receives the first mod's three\n" + describe(report));
 }
+
+// An asset mod changes an existing EBX (test/playlist) to reference a new TOC chunk,
+// adding NO new EBX or resources. The map carries the game's copy of test/playlist.
+// The merged map must receive the changed EBX and its referenced chunk, and reading
+// the chunk from the merged archive must return the donor's payload.
+void changed_ebx_carries_its_chunks_into_maps_copy() {
+    Fixture fixture("changed-ebx-chunk");
+    const auto chunkGuid = guid(0x77);
+    const Bytes chunkPayload{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
+    Bytes ebxData;
+    put_guid(ebxData, chunkGuid);
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {}, ebxData)},
+                 {"test/other", 0, ebx_document(guid(2), {})}},
+                {},
+                {{chunkGuid, chunkPayload}});
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.issue.empty() && report.built, "changed EBX chunk: merge builds patch\n" + describe(report));
+    const auto chunkResult = fixture.merged_chunk(map_toc, chunkGuid);
+    expect(chunkResult.has_value(), "changed EBX chunk: map superbundle TOC registers the new chunk");
+    if (chunkResult) {
+        expect(chunkResult->second == chunkPayload, "changed EBX chunk: reading chunk returns donor payload");
+    }
+}
 } // namespace
 
 int main() try {
@@ -363,6 +417,7 @@ int main() try {
     copy_in_the_adders_toc_is_left_alone();
     same_name_from_two_mods(true);
     same_name_from_two_mods(false);
+    changed_ebx_carries_its_chunks_into_maps_copy();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

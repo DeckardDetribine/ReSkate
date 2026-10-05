@@ -154,25 +154,47 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                 "; other mods' copies of the bundle get " + other + "'s");
         // The new TOC chunks this mod's carried EBX name (as raw GUID bytes, the way an
         // EBX stores a ChunkId), so they can follow those assets into other superbundles.
+        // Chunk dependencies attach to the selected asset version (changed or added),
+        // so only successfully propagated changes bring their required chunks.
         if (!newChunks.empty()) {
-            std::vector<std::vector<std::byte>> carried;
-            for (const auto& [bundle, list] : out.added)
-                for (const auto& addition : list)
-                    if (addition.mod == mod->name && addition.asset.kind == fb::AssetKind::ebx) try {
-                        carried.push_back(fb::decode_cas(addition.encoded, {gameRoot}));
-                    } catch (const std::exception&) {}
             std::set<fb::Guid> taken;
-            for (const auto& chunk : newChunks) {
-                const auto& id = chunk.guid.bytes;
-                if (!taken.contains(chunk.guid) && std::ranges::any_of(carried, [&](const std::vector<std::byte>& bytes) {
-                        return std::search(bytes.begin(), bytes.end(), id.begin(), id.end()) != bytes.end(); })) {
-                    out.chunks[mod->name].push_back(chunk);
-                    taken.insert(chunk.guid);
+            for (auto& [name, versions] : out.changed) {
+                for (auto& [sha1, change] : versions) {
+                    if (change.mod != mod->name) continue;
+                    try {
+                        const auto decodedPayload = fb::decode_cas(change.encoded, {gameRoot});
+                        for (const auto& chunk : newChunks) {
+                            const auto& id = chunk.guid.bytes;
+                            if (std::search(decodedPayload.begin(), decodedPayload.end(), id.begin(), id.end()) != decodedPayload.end()) {
+                                if (std::find_if(change.chunks.begin(), change.chunks.end(), [&](const auto& c) { return c.guid == chunk.guid; }) == change.chunks.end()) {
+                                    change.chunks.push_back(chunk);
+                                    taken.insert(chunk.guid);
+                                }
+                            }
+                        }
+                    } catch (const std::exception&) {}
+                }
+            }
+            for (auto& [bundle, list] : out.added) {
+                for (auto& addition : list) {
+                    if (addition.mod != mod->name || addition.asset.kind != fb::AssetKind::ebx) continue;
+                    try {
+                        const auto decodedPayload = fb::decode_cas(addition.encoded, {gameRoot});
+                        for (const auto& chunk : newChunks) {
+                            const auto& id = chunk.guid.bytes;
+                            if (std::search(decodedPayload.begin(), decodedPayload.end(), id.begin(), id.end()) != decodedPayload.end()) {
+                                if (std::find_if(addition.chunks.begin(), addition.chunks.end(), [&](const auto& c) { return c.guid == chunk.guid; }) == addition.chunks.end()) {
+                                    addition.chunks.push_back(chunk);
+                                    taken.insert(chunk.guid);
+                                }
+                            }
+                        }
+                    } catch (const std::exception&) {}
                 }
             }
             if (!taken.empty())
                 report.notes.push_back(mod->name + ": " + std::to_string(taken.size()) +
-                    " added chunk(s) follow its added assets into other mods' superbundles");
+                    " added chunk(s) follow its changes into other mods' superbundles");
         }
         if (changed)
             report.notes.push_back(mod->name + ": " + std::to_string(changed) +

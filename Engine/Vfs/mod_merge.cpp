@@ -293,10 +293,19 @@ MergeReport merge_mods(const Catalog& catalog, const MergeObserver& observe, con
         if (options.live) report.load_screens = read_load_screens(mods, modFiles, store, baseRoot, gameRoot, report);
         auto overrides = collect_asset_overrides(mods, modFiles, store, baseRoot, gameRoot, report);
         // Carried chunks point into their mod's archives; move them to where those landed.
-        for (auto& [name, chunks] : overrides.chunks)
+        const auto shift_chunk = [&](fb::TocChunk& chunk, const std::string& modName) {
             for (const auto* mod : mods)
-                if (mod->name == name)
-                    for (auto& chunk : chunks) store.shift(chunk.location, chunk.offset, &placements[mod]);
+                if (mod->name == modName)
+                    store.shift(chunk.location, chunk.offset, &placements[mod]);
+        };
+        for (auto& [name, versions] : overrides.changed)
+            for (auto& [sha1, change] : versions)
+                for (auto& chunk : change.chunks)
+                    shift_chunk(chunk, change.mod);
+        for (auto& [bundle, list] : overrides.added)
+            for (auto& addition : list)
+                for (auto& chunk : addition.chunks)
+                    shift_chunk(chunk, addition.mod);
 
         for (const auto& relative : superbundles) {
             if (keepRoot && lower(relative) == root_level) {
