@@ -3,6 +3,7 @@
 #include "mod_catalog.h"
 #include "native_db.h"
 #include "game_archives.h"
+#include "Engine/Resource/binary_bundle.h"
 #include "Engine/Resource/material_grid.h"
 #include "Engine/Resource/toc.h"
 
@@ -24,6 +25,11 @@ namespace fs = std::filesystem;
 namespace fb = frostbite;
 
 std::string lower(std::string_view text);
+
+inline std::string asset_key(const fb::BundleAsset& asset) {
+    return std::to_string(static_cast<int>(asset.kind)) + ':' +
+        (asset.kind == fb::AssetKind::chunk ? asset.guid.string() : lower(asset.name));
+}
 
 std::vector<std::byte> read_file(const fs::path& path);
 void write_file(const fs::path& path, std::span<const std::byte> bytes);
@@ -165,14 +171,12 @@ GridPlan plan_material_grid(const std::vector<const Mod*>& mods,
                             const std::map<const Mod*, RelativeFiles>& modFiles, const CasStore& store,
                             const fs::path& baseRoot, const fs::path& gameRoot, MergeReport& report);
 
-// An EBX asset a mod changed from the game's own copy. Maps carry the game's
-// copies of what their levels need (a level's camera framing, for one), and
-// those copies have to take the change too, or the mod works on the game's
-// levels and not on the maps.
+// An asset (EBX or resource) a mod changed from the game's own copy. Maps carry the game's
+// copies of what their levels need, and those copies have to take the change too, or the
+// mod works on the game's levels and not on the maps.
 struct AssetOverride {
     std::string mod;
-    fb::Sha1 sha1;                    // the mod's version
-    std::uint64_t originalSize{};
+    fb::BundleAsset asset;            // the mod's version (with kind, name, sha1, size, resourceId, resourceType, resourceMeta)
     std::vector<std::byte> encoded;   // its payload, as stored in cas
     std::vector<fb::TocChunk> chunks; // new chunks referenced by this change
 };

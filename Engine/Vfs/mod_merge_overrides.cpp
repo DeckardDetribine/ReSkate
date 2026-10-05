@@ -86,27 +86,43 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                             candidates.push_back({lower(bundle.name), {mod->name, asset, payload(), lower(relative)}});
                             continue;
                         }
-                        auto& versions = out.changed[name];
+                        auto& versions = out.changed[asset_key(asset)];
                         if (versions.contains(game_copy->second)) continue;
                         const auto& change = versions.emplace(game_copy->second,
-                            AssetOverride{mod->name, asset.sha1, asset.originalSize, payload()}).first->second;
+                            AssetOverride{mod->name, asset, payload()}).first->second;
                         ++changed;
                         try {
                             for (const auto& reference : decoded(change.encoded).imports)
                                 imported.insert(reference.fileGuid);
                         } catch (const std::exception&) {}
                     }
-                    // Resources the mod adds, kept to go with an added EBX of the same name
-                    // (a wave's sound-bank resource registers the wave with the audio system).
-                    std::set<std::string, std::less<>> shippedResources;
-                    for (const auto& asset : gameListing->manifest.resources) shippedResources.insert(lower(asset.name));
+                    // Resources: unchanged copies take changes other mods make; added resources follow companions.
+                    std::map<std::string, const fb::BundleAsset*, std::less<>> originalResources;
+                    for (const auto& asset : gameListing->manifest.resources) originalResources.emplace(lower(asset.name), &asset);
                     for (std::size_t index = 0; index < modListing->manifest.resources.size(); ++index) {
                         const auto& asset = modListing->manifest.resources[index];
                         const auto at = modListing->first + modListing->manifest.ebx.size() + index;
-                        if (shippedResources.contains(lower(asset.name)) || at >= modListing->files.size()) continue;
+                        if (at >= modListing->files.size()) continue;
                         const auto& file = modListing->files[at];
-                        companions.push_back({lower(bundle.name), {mod->name, asset,
-                            store.read(file.location.patch ? mod->directory : baseRoot, file.location, file.offset, file.size), lower(relative)}});
+                        const auto payload = [&] {
+                            return store.read(file.location.patch ? mod->directory : baseRoot,
+                                              file.location, file.offset, file.size);
+                        };
+                        const auto gameRes = originalResources.find(lower(asset.name));
+                        if (gameRes == originalResources.end()) {
+                            companions.push_back({lower(bundle.name), {mod->name, asset, payload(), lower(relative)}});
+                            continue;
+                        }
+                        const auto same = gameRes->second->sha1 == asset.sha1 &&
+                                          gameRes->second->originalSize == asset.originalSize &&
+                                          gameRes->second->resourceType == asset.resourceType &&
+                                          gameRes->second->resourceId == asset.resourceId &&
+                                          gameRes->second->resourceMeta == asset.resourceMeta;
+                        if (same) continue;
+                        auto& versions = out.changed[asset_key(asset)];
+                        if (versions.contains(gameRes->second->sha1)) continue;
+                        versions.emplace(gameRes->second->sha1, AssetOverride{mod->name, asset, payload()});
+                        ++changed;
                     }
                 }
             } catch (const std::exception& failure) {

@@ -66,10 +66,6 @@ std::vector<Asset> flatten(const fb::BundleRegion& region, const fb::BinaryBundl
     return result;
 }
 
-std::string asset_key(const fb::BundleAsset& asset) {
-    return std::to_string(static_cast<int>(asset.kind)) + ':' +
-        (asset.kind == fb::AssetKind::chunk ? asset.guid.string() : lower(asset.name));
-}
 
 // The game's item lists (items/itemmastercollection, a season's
 // 0.30.0_itemcollection), which every cosmetic mod adds its items to. The game
@@ -391,27 +387,36 @@ fb::TocDocument combine(const fs::path& baseToc, const fs::path& baseRoot,
         std::map<std::size_t, fb::BundleFileInfo> overridden;
         if (propagate && casBacked) {
             std::string example;
-            for (std::size_t index = 0; index < casManifest.ebx.size(); ++index) {
-                auto& asset = casManifest.ebx[index];
-                const auto named = overrides.changed.find(lower(asset.name));
-                if (named == overrides.changed.end()) continue;
-                const auto change = named->second.find(asset.sha1);
-                const auto at = 1 + index;
-                if (change == named->second.end() || change->second.mod == modName || at >= region.files.size())
-                    continue;
-                try {
-                    overridden[at] = store.write(region.files[at].location.installChunk, manifestArchive,
-                                                 change->second.encoded);
-                    asset.sha1 = change->second.sha1;
-                    asset.originalSize = change->second.originalSize;
-                    for (const auto& chunk : change->second.chunks)
-                        forwardedChunks.push_back({chunk, change->second.mod});
-                    if (example.empty()) example = asset.name + " from " + change->second.mod;
-                } catch (const std::exception& error) {
-                    report.notes.push_back(modName + ": " + bundle.name + ": " + asset.name +
-                        " kept the game's copy, the change could not be copied (" + error.what() + ")");
+            const auto apply_overrides = [&](std::vector<fb::BundleAsset>& assets, std::size_t fileBase) {
+                for (std::size_t index = 0; index < assets.size(); ++index) {
+                    auto& asset = assets[index];
+                    const auto named = overrides.changed.find(asset_key(asset));
+                    if (named == overrides.changed.end()) continue;
+                    const auto change = named->second.find(asset.sha1);
+                    const auto at = fileBase + index;
+                    if (change == named->second.end() || change->second.mod == modName || at >= region.files.size())
+                        continue;
+                    try {
+                        overridden[at] = store.write(region.files[at].location.installChunk, manifestArchive,
+                                                     change->second.encoded);
+                        asset.sha1 = change->second.asset.sha1;
+                        asset.originalSize = change->second.asset.originalSize;
+                        if (asset.kind == fb::AssetKind::resource) {
+                            asset.resourceId = change->second.asset.resourceId;
+                            asset.resourceType = change->second.asset.resourceType;
+                            asset.resourceMeta = change->second.asset.resourceMeta;
+                        }
+                        for (const auto& chunk : change->second.chunks)
+                            forwardedChunks.push_back({chunk, change->second.mod});
+                        if (example.empty()) example = asset.name + " from " + change->second.mod;
+                    } catch (const std::exception& error) {
+                        report.notes.push_back(modName + ": " + bundle.name + ": " + asset.name +
+                            " kept the game's copy, the change could not be copied (" + error.what() + ")");
+                    }
                 }
-            }
+            };
+            apply_overrides(casManifest.ebx, 1);
+            apply_overrides(casManifest.resources, 1 + casManifest.ebx.size());
             if (!overridden.empty())
                 report.notes.push_back(modName + ": " + bundle.name + ": " + std::to_string(overridden.size()) +
                     " asset(s) take another mod's change, e.g. " + example);

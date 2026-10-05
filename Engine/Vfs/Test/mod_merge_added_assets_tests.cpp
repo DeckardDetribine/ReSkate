@@ -156,7 +156,14 @@ fb::Sha1 sha(const std::string& name, unsigned version) {
 }
 
 struct Ebx { std::string name; unsigned version; Bytes payload; };
-struct Resource { std::string name; Bytes payload; };
+struct Resource {
+    std::string name;
+    Bytes payload;
+    unsigned version = 0;
+    std::uint64_t resourceId = 7;
+    std::uint32_t resourceType = 0xb2c465f6;
+    std::vector<std::byte> resourceMeta = std::vector<std::byte>(16, std::byte{0});
+};
 
 fb::BinaryBundle manifest_of(const std::vector<Ebx>& assets, const std::vector<Resource>& resources) {
     fb::BinaryBundle manifest;
@@ -172,10 +179,10 @@ fb::BinaryBundle manifest_of(const std::vector<Ebx>& assets, const std::vector<R
         fb::BundleAsset entry;
         entry.kind = fb::AssetKind::resource;
         entry.name = resource.name;
-        entry.sha1 = sha(resource.name, 0);
-        entry.resourceId = 7;
-        entry.resourceType = 0xb2c465f6;
-        entry.resourceMeta.assign(16, std::byte{0});
+        entry.sha1 = sha(resource.name, resource.version);
+        entry.resourceId = resource.resourceId;
+        entry.resourceType = resource.resourceType;
+        entry.resourceMeta = resource.resourceMeta;
         entry.originalSize = resource.payload.size();
         manifest.resources.push_back(std::move(entry));
     }
@@ -188,7 +195,8 @@ struct Fixture {
 
     struct Chunk { fb::Guid guid; Bytes payload; };
 
-    explicit Fixture(const std::string& name, const std::vector<Chunk>& baseChunks = {}) {
+    explicit Fixture(const std::string& name, const std::vector<Chunk>& baseChunks = {},
+                     const std::vector<Resource>& baseResources = {}) {
         wchar_t temp[MAX_PATH]{};
         GetTempPathW(MAX_PATH, temp);
         root = fs::path(temp) / ("reskate-merge-added-" + std::to_string(GetCurrentProcessId()) + "-" + name);
@@ -205,12 +213,17 @@ struct Fixture {
             files.push_back({{false, package, 1}, static_cast<std::uint32_t>(archive.size()), static_cast<std::uint32_t>(payload.size())});
             archive.insert(archive.end(), payload.begin(), payload.end());
         }
+        for (const auto& resource : baseResources) {
+            const auto payload = encoded(resource.payload);
+            files.push_back({{false, package, 1}, static_cast<std::uint32_t>(archive.size()), static_cast<std::uint32_t>(payload.size())});
+            archive.insert(archive.end(), payload.begin(), payload.end());
+        }
         std::vector<fb::TocChunk> toc_chunks;
         for (const auto& chunk : baseChunks) {
             toc_chunks.push_back({chunk.guid, {false, package, 1}, static_cast<std::uint32_t>(archive.size()), static_cast<std::uint32_t>(chunk.payload.size())});
             archive.insert(archive.end(), chunk.payload.begin(), chunk.payload.end());
         }
-        const std::vector<fb::TocBundle> bundles{{bundle_name, fb::write_bundle_region(files, fb::write_binary_bundle(manifest_of(assets, {}))), 1}};
+        const std::vector<fb::TocBundle> bundles{{bundle_name, fb::write_bundle_region(files, fb::write_binary_bundle(manifest_of(assets, baseResources))), 1}};
         write(catalog.data_root / "Data" / "layout.toc", layout_toc());
         write(catalog.data_root / "Data" / "Win32" / "test_shared.toc", fb::write_patch_toc(bundles, toc_chunks));
         write(catalog.data_root / "Data" / "Win32" / "pkg" / "cas_01.cas", archive);
@@ -277,6 +290,65 @@ struct Fixture {
                 if (chunk.offset + chunk.size > archive.size()) return std::make_pair(chunk, Bytes{});
                 Bytes payload(archive.begin() + chunk.offset, archive.begin() + chunk.offset + chunk.size);
                 return std::make_pair(chunk, std::move(payload));
+            }
+        }
+        return std::nullopt;
+    }
+
+    struct MergedAsset {
+        fb::BundleAsset asset;
+        Bytes payload;
+    };
+    std::optional<MergedAsset> merged_asset(const std::string& relative, fb::AssetKind kind, const std::string& name) const {
+        const auto tocPath = catalog.root / mods::generated_folder / "Win32" / fs::path(relative);
+        if (!fs::exists(tocPath)) return std::nullopt;
+        const auto doc = fb::read_toc(read(tocPath));
+        for (const auto& bundle : doc.bundles) {
+            if (bundle.name != bundle_name) continue;
+            const auto region = fb::read_bundle_region(bundle.region);
+            fb::BinaryBundle manifest;
+            std::size_t fileOffset = 0;
+            if (!region.inlineManifest.empty()) {
+                manifest = fb::read_binary_bundle(region.inlineManifest);
+            } else if (!region.files.empty()) {
+                const auto& mfile = region.files.front();
+                const auto archiveFile = "cas_" + (mfile.location.archive < 10 ? std::string("0") : std::string{}) +
+                                         std::to_string(mfile.location.archive) + ".cas";
+                const auto archivePath = mfile.location.patch
+                    ? catalog.root / mods::generated_folder / "Win32" / "pkg" / fs::path(archiveFile)
+                    : catalog.data_root / "Data" / "Win32" / "pkg" / fs::path(archiveFile);
+                if (!fs::exists(archivePath)) return std::nullopt;
+                const auto archive = read(archivePath);
+                if (mfile.offset + mfile.size > archive.size()) return std::nullopt;
+                manifest = fb::read_binary_bundle(std::span<const std::byte>(archive.data() + mfile.offset, mfile.size));
+                fileOffset = 1;
+            } else {
+                return std::nullopt;
+            }
+
+            const auto& list = (kind == fb::AssetKind::ebx) ? manifest.ebx : manifest.resources;
+            for (std::size_t i = 0; i < list.size(); ++i) {
+                if (list[i].name == name) {
+                    const std::size_t fileIdx = fileOffset + (kind == fb::AssetKind::ebx ? 0 : manifest.ebx.size()) + i;
+                    if (fileIdx >= region.files.size()) return std::nullopt;
+                    const auto& file = region.files[fileIdx];
+                    const auto archiveFile = "cas_" + (file.location.archive < 10 ? std::string("0") : std::string{}) +
+                                             std::to_string(file.location.archive) + ".cas";
+                    const auto archivePath = file.location.patch
+                        ? catalog.root / mods::generated_folder / "Win32" / "pkg" / fs::path(archiveFile)
+                        : catalog.data_root / "Data" / "Win32" / "pkg" / fs::path(archiveFile);
+                    if (!fs::exists(archivePath)) return std::nullopt;
+                    const auto archive = read(archivePath);
+                    if (file.offset + file.size > archive.size()) return std::nullopt;
+                    Bytes raw(archive.begin() + file.offset, archive.begin() + file.offset + file.size);
+                    Bytes decodedPayload;
+                    try {
+                        decodedPayload = fb::decode_cas(raw, {});
+                    } catch (...) {
+                        decodedPayload = std::move(raw);
+                    }
+                    return MergedAsset{list[i], std::move(decodedPayload)};
+                }
             }
         }
         return std::nullopt;
@@ -442,6 +514,44 @@ void changed_chunk_retaining_existing_guid_propagates() {
         expect(chunkResult->second == modPayload, "changed existing chunk: reading chunk returns modified mod payload");
     }
 }
+
+// An asset mod replaces an existing resource in a base bundle with new payload and updated metadata.
+// A map superbundle carrying the base bundle must receive the mod's replaced resource payload and metadata.
+void changed_resource_replaces_base_resource_in_maps_copy() {
+    const std::string resName = "test/collision";
+    const Bytes baseResPayload{std::byte{0x55}, std::byte{0x66}, std::byte{0x77}};
+    const Bytes modResPayload{std::byte{0xAA}, std::byte{0xBB}, std::byte{0xCC}, std::byte{0xDD}};
+
+    Resource baseRes;
+    baseRes.name = resName;
+    baseRes.payload = baseResPayload;
+    baseRes.version = 0;
+    baseRes.resourceType = 0x11112222;
+
+    Fixture fixture("changed-resource-replacement", {}, {baseRes});
+
+    Resource modRes;
+    modRes.name = resName;
+    modRes.payload = modResPayload;
+    modRes.version = 1;
+    modRes.resourceType = 0x33334444;
+
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 0, ebx_document(guid(1), {})},
+                 {"test/other", 0, ebx_document(guid(2), {})}},
+                {modRes});
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy(), {baseRes});
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.issue.empty() && report.built, "changed resource: merge builds patch\n" + describe(report));
+    const auto assetResult = fixture.merged_asset(map_toc, fb::AssetKind::resource, resName);
+    expect(assetResult.has_value(), "changed resource: map superbundle bundle contains the resource");
+    if (assetResult) {
+        expect(assetResult->payload == modResPayload, "changed resource: reading resource returns modified mod payload");
+        expect(assetResult->asset.sha1 == sha(resName, 1), "changed resource: resource SHA1 matches mod replacement");
+        expect(assetResult->asset.resourceType == 0x33334444, "changed resource: resourceType matches mod replacement");
+    }
+}
 } // namespace
 
 int main() try {
@@ -454,6 +564,7 @@ int main() try {
     same_name_from_two_mods(false);
     changed_ebx_carries_its_chunks_into_maps_copy();
     changed_chunk_retaining_existing_guid_propagates();
+    changed_resource_replaces_base_resource_in_maps_copy();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;
