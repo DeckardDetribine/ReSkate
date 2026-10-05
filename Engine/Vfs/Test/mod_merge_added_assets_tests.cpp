@@ -47,6 +47,9 @@ void expect(bool ok, const std::string& what) {
 void put32(Bytes& out, std::uint32_t value) {
     for (int shift = 0; shift < 32; shift += 8) out.push_back(static_cast<std::byte>(value >> shift));
 }
+void put64(Bytes& out, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) out.push_back(static_cast<std::byte>(value >> shift));
+}
 void put_bytes(Bytes& out, std::string_view text) {
     for (const char c : text) out.push_back(static_cast<std::byte>(c));
 }
@@ -68,7 +71,7 @@ Bytes read(const fs::path& path) {
     return bytes;
 }
 
-// ---- An EBX document with no instances: a file GUID and the files it imports. -----------------
+// ---- An EBX document with no instances: a file GUID, the files it imports, and optional resource refs.
 // That is all the merge reads from an asset to follow what it refers to.
 void chunk(Bytes& out, const char (&id)[5], const Bytes& body) {
     put_bytes(out, std::string_view(id, 4));
@@ -76,10 +79,15 @@ void chunk(Bytes& out, const char (&id)[5], const Bytes& body) {
     out.insert(out.end(), body.begin(), body.end());
     if (body.size() & 1) out.push_back(std::byte{0});
 }
-Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports, const Bytes& customData = {}) {
+Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports,
+                   const Bytes& customData = {}, const std::vector<std::uint64_t>& resourceRefs = {}) {
     Bytes fixup;
     put_guid(fixup, file);
-    for (int i = 0; i < 6; ++i) put32(fixup, 0);   // types, signatures, exported, instances, pointers, resource refs
+    for (int i = 0; i < 5; ++i) put32(fixup, 0);   // types, signatures, exported, instances, pointers
+    put32(fixup, static_cast<std::uint32_t>(resourceRefs.size()));
+    for (std::size_t i = 0; i < resourceRefs.size(); ++i) {
+        put32(fixup, static_cast<std::uint32_t>(i * 8));
+    }
     put32(fixup, static_cast<std::uint32_t>(imports.size()));
     for (const auto& import : imports) {
         put_guid(fixup, import);
@@ -87,7 +95,10 @@ Bytes ebx_document(const fb::Guid& file, const std::vector<fb::Guid>& imports, c
     }
     for (int i = 0; i < 2; ++i) put32(fixup, 0);   // import relocations, type-info references
     for (int i = 0; i < 3; ++i) put32(fixup, 0);   // array, boxed-value and string sections
-    const Bytes data = customData.empty() ? Bytes(16) : customData;
+    Bytes data;
+    for (const auto ref : resourceRefs) put64(data, ref);
+    data.insert(data.end(), customData.begin(), customData.end());
+    if (data.size() < 16) data.resize(16);
     Bytes extra;
     put32(extra, 0);                               // arrays
     put32(extra, 0);                               // boxed values
@@ -552,6 +563,111 @@ void changed_resource_replaces_base_resource_in_maps_copy() {
         expect(assetResult->asset.resourceType == 0x33334444, "changed resource: resourceType matches mod replacement");
     }
 }
+
+// Transitive dependency resolution:
+// - A changed EBX ("test/playlist") imports an added EBX ("test/song").
+// - Added EBX ("test/song") imports an added EBX ("test/wave").
+// - Added EBX ("test/wave") has a resource reference pointing to resourceId 0x12345678.
+// - An added resource ("res/audio_stream", different name!) has resourceId 0x12345678,
+//   and its payload contains the GUID of chunk 0x88.
+// - Mod also adds chunk 0x88.
+// - Mod also adds unrelated EBX, resource, and chunk which must NOT be taken.
+// When map's copy is merged, it must receive:
+// test/song, test/wave, res/audio_stream, and chunk 0x88.
+void transitive_structured_dependencies_follow_selected_ebx() {
+    Fixture fixture("transitive-deps");
+
+    const auto songGuid = guid(0xA1);
+    const auto waveGuid = guid(0xA2);
+    const auto unrelatedGuid = guid(0x99);
+    const auto chunkGuid = guid(0x88);
+    const auto unrelatedChunkGuid = guid(0x77);
+
+    const std::uint64_t audioStreamResId = 0x12345678ULL;
+    const std::uint64_t unrelatedResId = 0x99999999ULL;
+
+    Bytes resPayload;
+    put_guid(resPayload, chunkGuid);
+    resPayload.resize(32, std::byte{0x55});
+
+    Bytes unrelatedResPayload;
+    put_guid(unrelatedResPayload, unrelatedChunkGuid);
+
+    Resource audioStreamRes;
+    audioStreamRes.name = "res/audio_stream";
+    audioStreamRes.payload = resPayload;
+    audioStreamRes.resourceId = audioStreamResId;
+
+    Resource unrelatedRes;
+    unrelatedRes.name = "res/unrelated";
+    unrelatedRes.payload = unrelatedResPayload;
+    unrelatedRes.resourceId = unrelatedResId;
+
+    const Bytes chunkPayload{std::byte{0xDE}, std::byte{0xAD}, std::byte{0xBE}, std::byte{0xEF}};
+    const Bytes unrelatedChunkPayload{std::byte{0x01}, std::byte{0x02}};
+
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {songGuid})},
+                 {"test/other", 0, ebx_document(guid(2), {})},
+                 {"test/song", 0, ebx_document(songGuid, {waveGuid})},
+                 {"test/wave", 0, ebx_document(waveGuid, {}, {}, {audioStreamResId})},
+                 {"test/unrelated", 0, ebx_document(unrelatedGuid, {}, {}, {unrelatedResId})}},
+                {audioStreamRes, unrelatedRes},
+                {{chunkGuid, chunkPayload}, {unrelatedChunkGuid, unrelatedChunkPayload}});
+
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.issue.empty() && report.built, "transitive deps: merge builds patch\n" + describe(report));
+
+    const auto song = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/song");
+    expect(song.has_value(), "transitive deps: map copy receives imported test/song");
+
+    const auto wave = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/wave");
+    expect(wave.has_value(), "transitive deps: map copy receives transitively imported test/wave");
+
+    const auto stream = fixture.merged_asset(map_toc, fb::AssetKind::resource, "res/audio_stream");
+    expect(stream.has_value(), "transitive deps: map copy receives referenced res/audio_stream");
+
+    const auto chunk = fixture.merged_chunk(map_toc, chunkGuid);
+    expect(chunk.has_value(), "transitive deps: map copy receives chunk 0x88 from resource");
+    if (chunk) {
+        expect(chunk->second == chunkPayload, "transitive deps: chunk 0x88 payload matches");
+    }
+
+    const auto unrelatedEbx = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/unrelated");
+    expect(!unrelatedEbx.has_value(), "transitive deps: unreferenced test/unrelated is NOT merged");
+
+    const auto unrelatedResource = fixture.merged_asset(map_toc, fb::AssetKind::resource, "res/unrelated");
+    expect(!unrelatedResource.has_value(), "transitive deps: unreferenced res/unrelated is NOT merged");
+
+    const auto unrelatedChunk = fixture.merged_chunk(map_toc, unrelatedChunkGuid);
+    expect(!unrelatedChunk.has_value(), "transitive deps: unreferenced chunk is NOT merged");
+}
+
+void transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members() {
+    Fixture fixture("cycle-deps");
+
+    const auto nodeA = guid(0x51);
+    const auto nodeB = guid(0x52);
+
+    fixture.add("patchmod", false, shared_toc, {},
+                {{"test/playlist", 1, ebx_document(guid(1), {nodeA})},
+                 {"test/other", 0, ebx_document(guid(2), {})},
+                 {"test/nodeA", 0, ebx_document(nodeA, {nodeB})},
+                 {"test/nodeB", 0, ebx_document(nodeB, {nodeA})}});
+
+    fixture.add("map", true, map_toc, {map_superbundle}, game_copy());
+
+    const auto report = mods::merge_mods(fixture.catalog);
+    expect(report.issue.empty() && report.built, "cycle deps: merge builds patch\n" + describe(report));
+
+    const auto a = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/nodeA");
+    expect(a.has_value(), "cycle deps: map copy receives nodeA");
+
+    const auto b = fixture.merged_asset(map_toc, fb::AssetKind::ebx, "test/nodeB");
+    expect(b.has_value(), "cycle deps: map copy receives cyclic nodeB");
+}
 } // namespace
 
 int main() try {
@@ -565,6 +681,8 @@ int main() try {
     changed_ebx_carries_its_chunks_into_maps_copy();
     changed_chunk_retaining_existing_guid_propagates();
     changed_resource_replaces_base_resource_in_maps_copy();
+    transitive_structured_dependencies_follow_selected_ebx();
+    transitive_ebx_import_cycle_terminates_and_merges_all_cycle_members();
     if (failures) {
         std::cerr << failures << " failure(s)\n";
         return 1;

@@ -28,8 +28,30 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
         std::vector<std::pair<std::string, AssetAddition>> candidates, companions;
         std::vector<fb::TocChunk> newChunks;   // TOC chunks the game's TOCs do not have
         std::set<fb::Guid> imported;
-        const auto decoded = [&](std::span<const std::byte> encoded) {
-            return fb::ebx::read_document(fb::decode_cas(encoded, {gameRoot}));
+        std::set<std::uint64_t> referencedResources;
+        struct EbxReferences {
+            fb::Guid fileGuid;
+            std::vector<fb::Guid> imports;
+            std::vector<std::uint64_t> resourceRefs;
+        };
+        const auto parse_ebx = [&](std::span<const std::byte> encoded) -> EbxReferences {
+            const auto bytes = fb::decode_cas(encoded, {gameRoot});
+            const auto doc = fb::ebx::read_document(bytes);
+            EbxReferences refs;
+            refs.fileGuid = doc.fileGuid;
+            refs.imports.reserve(doc.imports.size());
+            for (const auto& imp : doc.imports) refs.imports.push_back(imp.fileGuid);
+            refs.resourceRefs.reserve(doc.resourceRefOffsets.size());
+            for (const auto offset : doc.resourceRefOffsets) {
+                if (doc.dataStart + offset + 8 <= bytes.size()) {
+                    std::uint64_t id = 0;
+                    for (int b = 0; b < 8; ++b) {
+                        id |= static_cast<std::uint64_t>(std::to_integer<std::uint8_t>(bytes[doc.dataStart + offset + b])) << (b * 8);
+                    }
+                    if (id != 0) refs.resourceRefs.push_back(id);
+                }
+            }
+            return refs;
         };
         for (const auto& relative : files->second.tocs) {
             std::error_code error;
@@ -92,8 +114,9 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                             AssetOverride{mod->name, asset, payload()}).first->second;
                         ++changed;
                         try {
-                            for (const auto& reference : decoded(change.encoded).imports)
-                                imported.insert(reference.fileGuid);
+                            const auto refs = parse_ebx(change.encoded);
+                            imported.insert(refs.imports.begin(), refs.imports.end());
+                            referencedResources.insert(refs.resourceRefs.begin(), refs.resourceRefs.end());
                         } catch (const std::exception&) {}
                     }
                     // Resources: unchanged copies take changes other mods make; added resources follow companions.
@@ -152,13 +175,19 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
         };
         // Transitively: an addition a following addition imports follows too (a new song
         // imports its new wave, and only the song is named by the changed playlist).
-        struct Candidate { fb::Guid file; std::vector<fb::Guid> imports; bool taken{}; };
+        struct Candidate {
+            fb::Guid file;
+            std::vector<fb::Guid> imports;
+            std::vector<std::uint64_t> resourceRefs;
+            bool taken{};
+        };
         std::vector<Candidate> parsed(candidates.size());
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             try {
-                const auto document = decoded(candidates[index].second.encoded);
-                parsed[index].file = document.fileGuid;
-                for (const auto& reference : document.imports) parsed[index].imports.push_back(reference.fileGuid);
+                const auto refs = parse_ebx(candidates[index].second.encoded);
+                parsed[index].file = refs.fileGuid;
+                parsed[index].imports = std::move(refs.imports);
+                parsed[index].resourceRefs = std::move(refs.resourceRefs);
             } catch (const std::exception&) { parsed[index].taken = true; }   // unreadable: never follows
         }
         for (bool grew = true; grew;) {
@@ -168,19 +197,26 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
                 if (candidate.taken || !imported.contains(candidate.file)) continue;
                 candidate.taken = grew = true;
                 imported.insert(candidate.imports.begin(), candidate.imports.end());
+                referencedResources.insert(candidate.resourceRefs.begin(), candidate.resourceRefs.end());
                 auto& [bundle, addition] = candidates[index];
                 keep(bundle, std::move(addition));
             }
         }
         for (auto& [bundle, companion] : companions) {
-            // Looked up, not made: a bundle with nothing carried must stay out of `added`.
-            const auto found = out.added.find(bundle);
-            if (found == out.added.end()) continue;
-            const auto name = lower(companion.asset.name);
-            if (std::ranges::any_of(found->second, [&](const AssetAddition& addition) {
-                    return addition.mod == mod->name && addition.asset.kind == fb::AssetKind::ebx &&
-                           lower(addition.asset.name) == name; }))
-                keep(bundle, std::move(companion));
+            bool match = false;
+            if (companion.asset.resourceId != 0 && referencedResources.contains(companion.asset.resourceId)) {
+                match = true;
+            } else {
+                const auto found = out.added.find(bundle);
+                if (found != out.added.end()) {
+                    const auto name = lower(companion.asset.name);
+                    match = std::ranges::any_of(found->second, [&](const AssetAddition& addition) {
+                        return addition.mod == mod->name && addition.asset.kind == fb::AssetKind::ebx &&
+                               lower(addition.asset.name) == name;
+                    });
+                }
+            }
+            if (match) keep(bundle, std::move(companion));
         }
         for (const auto& [other, clash] : shadowed)
             report.notes.push_back(mod->name + ": " + std::to_string(clash.first) +
@@ -211,7 +247,7 @@ AssetOverrides collect_asset_overrides(const std::vector<const Mod*>& mods,
             }
             for (auto& [bundle, list] : out.added) {
                 for (auto& addition : list) {
-                    if (addition.mod != mod->name || addition.asset.kind != fb::AssetKind::ebx) continue;
+                    if (addition.mod != mod->name || (addition.asset.kind != fb::AssetKind::ebx && addition.asset.kind != fb::AssetKind::resource)) continue;
                     try {
                         const auto decodedPayload = fb::decode_cas(addition.encoded, {gameRoot});
                         for (const auto& chunk : newChunks) {
